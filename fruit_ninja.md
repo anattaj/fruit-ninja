@@ -31,12 +31,21 @@ same blade) adds a combo bonus equal to the count. Waves speed up and carry
 more fruit and bombs over the first 90 seconds. Best score is kept in the
 browser's localStorage.
 
-A blade only cuts while it moves faster than 0.6 screen widths per second, so a
-finger held still over a fruit does nothing; you have to swipe. Two hands give
-two blades. Each fingertip is matched to the blade it was last frame, so the
-hands never swap blades and draw one giant cut across the screen. Tuning
-constants (slice speed, trail length, combo gap, gravity, lives) sit together
-at the top of the script.
+A blade only cuts while it moves faster than a set speed, so a finger held
+still over a fruit does nothing; you have to swipe. Two hands give two blades.
+Each fingertip is matched to the blade it was last frame, so the hands never
+swap blades and draw one giant cut across the screen.
+
+Sensitivity is tuned live from the Sensitivity button (bottom right, or S),
+and remembered in localStorage. Swipe sensitivity 1-10 sets the cutting speed
+from 0.9 down to 0.15 screen widths per second; hand detection 1-10 sets the
+tracker's confidence floor from 0.7 down to 0.15 and applies to the running
+tracker at once. Defaults are swipe 7 and detection 6 (0.4 and about 0.39),
+picked on the real camera. The white dot on your
+fingertip shows when the tracker has your hand: if it flickers, raise
+detection; if fast swipes still don't cut, raise swipe. Fixed constants (trail
+length, combo gap, hit padding, gravity, lives) sit together at the top of the
+script.
 
 Fruit, halves, juice, and sound are all drawn and synthesized in code; there
 are no image or audio files.
@@ -65,4 +74,12 @@ Free. Everything runs locally in the browser; no API calls.
   doomscroll-lock-in, because Python is not installed here. Mouse play
   (slicing, halves, juice, combos, bomb, game over, best score) and hand model
   load verified in the preview pane; hand tracking not yet verified on a real
+  camera.
+- 2026-10-08 - Hand detection felt not sensitive enough on first real use.
+  Cause: tracker confidence floor of 0.5, slice speed of 0.6, and smoothing
+  that ate swipe speed. Fix: confidence and slice speed now come from a live
+  Sensitivity panel (defaults about 0.33 and 0.4), smoothing lightened to 0.85,
+  hit area padded to 1.25 radii, and a blade survives 300 ms of lost tracking
+  instead of 200 ms.
+- 2026-10-08 - Defaults set to swipe 7, detection 6 after tuning on the real
   camera.
