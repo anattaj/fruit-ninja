@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fruit Ninja</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap" rel="stylesheet">
+<style>
+  :root { --bg: #1a0f08; --text: #fff4e0; --dim: #d9c3a3; --accent: #ffcf3f; --panel: rgba(20, 10, 4, 0.82); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, sans-serif; user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  video { display: none; }
+  #intro { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; background: rgba(0,0,0,0.45); }
+  #intro.gone { display: none; }
+  .card { background: var(--panel); border: 2px solid #5a3a1c; border-radius: 18px; padding: 28px 24px; max-width: 460px; width: 100%; text-align: center; }
+  h1 { font: 56px/1 "Luckiest Guy", system-ui, sans-serif; margin: 0 0 8px; color: var(--accent);
+    text-shadow: 0 4px 0 #a5520c, 0 8px 18px rgba(0,0,0,0.6); letter-spacing: 0.02em; }
+  .card p { color: var(--dim); margin: 0 0 18px; }
+  .btns { display: flex; flex-direction: column; gap: 10px; }
+  button { font: 22px "Luckiest Guy", system-ui, sans-serif; letter-spacing: 0.04em; padding: 12px 18px 9px; border-radius: 12px; border: 0;
+    background: var(--accent); color: #3a1d05; cursor: pointer; box-shadow: 0 4px 0 #a5520c; }
+  button.ghost { background: #3a2412; color: var(--text); box-shadow: 0 4px 0 #1e1108; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #msg { min-height: 1.5em; margin-top: 14px; font-size: 14px; }
+  .fine { font-size: 12px; color: #a89070; margin-top: 12px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<video id="cam" playsinline muted></video>
+
+<div id="intro"><div class="card">
+  <h1>Fruit Ninja</h1>
+  <p>Slice fruit out of the air with your finger. Point your index finger at the screen and swipe fast. Don't hit the bombs.</p>
+  <div class="btns">
+    <button id="camBtn">Play with webcam</button>
+    <button id="mouseBtn" class="ghost">Play with mouse</button>
+  </div>
+  <div id="msg"></div>
+  <div class="fine">Hand tracking runs in your browser. The camera feed is never uploaded or saved. F for fullscreen, M to mute.</div>
+</div></div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = (id) => document.getElementById(id);
+const cv = $("game"), ctx = cv.getContext("2d"), cam = $("cam");
+const FONT = '"Luckiest Guy", system-ui, sans-serif';
+
+// Tuning. Speeds are in screen widths per second so they feel the same at any window size.
+const SLICE_SPEED = 0.6;     // blade has to move at least this fast to cut; a hovering finger never slices
+const TRAIL_MS = 130;        // how long the blade trail lingers
+const COMBO_GAP_MS = 260;    // slices closer together than this by one blade count as one combo
+const GRAVITY = 1.55;        // in screen heights per second squared
+const LIVES = 3;
+
+let W, H, R, wood;
+let mode = "intro";          // intro, menu, play, boom, over
+let fruits = [], halves = [], parts = [], stains = [], popups = [], misses = [];
+let score = 0, lost = 0, best = 0, playTime = 0, nextWave = 0, waveNo = 0, boomAt = null, boomT = 0;
+let hands = null, lastVideoTime = -1, usingCam = false, muted = false, ac = null, noise = null;
+try { best = Number(localStorage.getItem("fruitNinjaBest")) || 0; } catch {}
+
+// ---------- fruit look ----------
+const TYPES = {
+  watermelon: { size: 1.35, skin: "#3aa64a", dark: "#1b5e20", rind: "#dff5b8", flesh: "#ff3f56", juice: "#ff2d4a" },
+  orange:     { size: 1.0,  skin: "#ff9f1c", dark: "#d66a00", rind: "#fff1cf", flesh: "#ffb23e", juice: "#ffa21f", segments: true },
+  apple:      { size: 0.95, skin: "#e3283a", dark: "#8f0f1d", rind: "#fff6de", flesh: "#fff0c2", juice: "#fff3c4" },
+  lemon:      { size: 0.85, skin: "#ffe135", dark: "#d9ad00", rind: "#fffbe0", flesh: "#fff27a", juice: "#fff04a", segments: true },
+  kiwi:       { size: 0.8,  skin: "#8b6b3d", dark: "#55401f", rind: "#c3e88a", flesh: "#7cc23a", juice: "#9be04a" },
+  plum:       { size: 0.85, skin: "#8a35a0", dark: "#4a1257", rind: "#f7e08a", flesh: "#f2c94c", juice: "#c03fd6" },
+};
+const KINDS = Object.keys(TYPES);
+
+function lighten(hex, k = 0.45) {
+  const n = parseInt(hex.slice(1), 16), c = [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v + (255 - v) * k));
+  return `rgb(${c})`;
+}
+
+function circle(x, y, r, fill) { ctx.fillStyle = fill; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+
+function drawWhole(f) {
+  const t = TYPES[f.type], r = f.r;
+  ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot);
+  if (f.type === "lemon") ctx.scale(1.2, 0.9);
+  ctx.shadowColor = "rgba(0,0,0,0.45)"; ctx.shadowBlur = r * 0.4; ctx.shadowOffsetY = r * 0.15;
+  const g = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r);
+  g.addColorStop(0, lighten(t.skin)); g.addColorStop(0.55, t.skin); g.addColorStop(1, t.dark);
+  circle(0, 0, r, g);
+  ctx.shadowColor = "transparent";
+  ctx.save(); ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.clip();
+  if (f.type === "watermelon") {
+    ctx.fillStyle = t.dark; ctx.globalAlpha = 0.8;
+    for (let k = -2; k <= 2; k++) {
+      ctx.beginPath(); ctx.ellipse(k * r * 0.44, 0, r * 0.11, r * 1.05, k * 0.08, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (f.type === "kiwi") {
+    ctx.fillStyle = "#3d2c14"; ctx.globalAlpha = 0.5;
+    for (const [dx, dy] of f.dots) { ctx.fillRect(dx * r, dy * r, r * 0.05, r * 0.05); }
+  }
+  ctx.restore();
+  if (f.type === "apple") {
+    ctx.strokeStyle = "#5b3a1a"; ctx.lineWidth = r * 0.1; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, -r * 0.82); ctx.quadraticCurveTo(r * 0.05, -r * 1.1, r * 0.15, -r * 1.22); ctx.stroke();
+    ctx.fillStyle = "#4caf50"; ctx.beginPath(); ctx.ellipse(r * 0.38, -r * 1.02, r * 0.28, r * 0.12, -0.5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.beginPath(); ctx.ellipse(-r * 0.42, -r * 0.45, r * 0.24, r * 0.13, -0.7, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+// The inside of a fruit, as seen on a cut half. Drawn in the half's own frame.
+function drawFace(type, r) {
+  const t = TYPES[type];
+  circle(0, 0, r, t.dark);
+  circle(0, 0, r * 0.9, t.rind);
+  circle(0, 0, r * (type === "watermelon" ? 0.78 : 0.84), t.flesh);
+  if (t.segments) {
+    ctx.strokeStyle = t.rind; ctx.lineWidth = r * 0.05;
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * Math.PI * 2;
+      ctx.beginPath(); ctx.moveTo(Math.cos(a) * r * 0.12, Math.sin(a) * r * 0.12); ctx.lineTo(Math.cos(a) * r * 0.8, Math.sin(a) * r * 0.8); ctx.stroke();
+    }
+    circle(0, 0, r * 0.12, t.rind);
+  } else if (type === "watermelon") {
+    ctx.fillStyle = "#1a1a1a";
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2, d = r * (i % 2 ? 0.32 : 0.52);
+      ctx.beginPath(); ctx.ellipse(Math.cos(a) * d, Math.sin(a) * d, r * 0.05, r * 0.085, a + Math.PI / 2, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (type === "kiwi") {
+    circle(0, 0, r * 0.3, "#f4f9e0");
+    ctx.fillStyle = "#111";
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * Math.PI * 2;
+      ctx.beginPath(); ctx.ellipse(Math.cos(a) * r * 0.42, Math.sin(a) * r * 0.42, r * 0.03, r * 0.07, a + Math.PI / 2, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (type === "apple") {
+    ctx.fillStyle = "#5b3a1a";
+    for (const s of [-1, 1]) { ctx.beginPath(); ctx.ellipse(s * r * 0.14, s * r * 0.02, r * 0.06, r * 0.11, s * 0.4, 0, Math.PI * 2); ctx.fill(); }
+  } else if (type === "plum") {
+    ctx.fillStyle = "#8a4b1f"; ctx.beginPath(); ctx.ellipse(0, 0, r * 0.34, r * 0.24, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawHalf(h) {
+  ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(h.rot);
+  ctx.beginPath(); ctx.rect(-h.r * 1.5, h.side < 0 ? -h.r * 1.5 : 0, h.r * 3, h.r * 1.5); ctx.clip();
+  if (h.type === "lemon") ctx.scale(1.2, 0.9);
+  drawFace(h.type, h.r);
+  ctx.restore();
+}
+
+function drawBomb(f, now) {
+  const r = f.r;
+  ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot);
+  ctx.shadowColor = "rgba(255,40,40,0.8)"; ctx.shadowBlur = r * 0.6;
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.05, 0, 0, r);
+  g.addColorStop(0, "#5a5a66"); g.addColorStop(0.5, "#1c1c22"); g.addColorStop(1, "#000");
+  circle(0, 0, r, g);
+  ctx.shadowColor = "transparent";
+  ctx.fillStyle = "#333"; ctx.fillRect(-r * 0.22, -r * 1.12, r * 0.44, r * 0.25);
+  ctx.strokeStyle = "#c8a46a"; ctx.lineWidth = r * 0.08; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(0, -r * 1.1); ctx.quadraticCurveTo(r * 0.25, -r * 1.45, r * 0.45, -r * 1.35); ctx.stroke();
+  const flick = 0.7 + 0.3 * Math.sin(now / 40 + f.x);
+  circle(r * 0.47, -r * 1.37, r * 0.2 * flick, "#ffea70");
+  circle(r * 0.47, -r * 1.37, r * 0.1, "#fff");
+  ctx.strokeStyle = "rgba(255,60,60,0.9)"; ctx.lineWidth = r * 0.12;
+  ctx.beginPath(); ctx.moveTo(-r * 0.3, -r * 0.3); ctx.lineTo(r * 0.3, r * 0.3); ctx.moveTo(r * 0.3, -r * 0.3); ctx.lineTo(-r * 0.3, r * 0.3); ctx.stroke();
+  ctx.restore();
+}
+
+// ---------- background ----------
+function resize() {
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  W = Math.max(1, innerWidth); H = Math.max(1, innerHeight);
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  R = Math.min(W, H) * 0.06;
+  wood = document.createElement("canvas"); wood.width = W; wood.height = H;
+  const w = wood.getContext("2d"), plank = Math.max(90, W / 9);
+  for (let x = 0, i = 0; x < W; x += plank, i++) {
+    const g = w.createLinearGradient(x, 0, x + plank, 0), base = ["#6b3f1d", "#7a4822", "#62391a"][i % 3];
+    g.addColorStop(0, "#3a200c"); g.addColorStop(0.06, base); g.addColorStop(0.94, base); g.addColorStop(1, "#2e1909");
+    w.fillStyle = g; w.fillRect(x, 0, plank, H);
+    w.strokeStyle = "rgba(30,15,5,0.25)"; w.lineWidth = 2;
+    for (let k = 0; k < 5; k++) {
+      const gx = x + plank * (0.2 + 0.15 * k);
+      w.beginPath(); w.moveTo(gx, 0);
+      for (let y = 0; y <= H; y += 40) w.lineTo(gx + Math.sin(y / 90 + i * 3 + k) * 6, y);
+      w.stroke();
+    }
+  }
+  const v = w.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
+  v.addColorStop(0, "rgba(0,0,0,0)"); v.addColorStop(1, "rgba(0,0,0,0.6)");
+  w.fillStyle = v; w.fillRect(0, 0, W, H);
+}
+addEventListener("resize", resize);
+resize();
+
+// The camera is drawn mirrored and cropped to cover the window. camRect is shared
+// with the landmark mapping so the blade sits exactly on your fingertip.
+function camRect() {
+  const vw = cam.videoWidth, vh = cam.videoHeight, s = Math.max(W / vw, H / vh);
+  return { dw: vw * s, dh: vh * s, ox: (W - vw * s) / 2, oy: (H - vh * s) / 2 };
+}
+
+function drawBackground() {
+  if (usingCam && cam.readyState >= 2) {
+    const { dw, dh, ox, oy } = camRect();
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1);
+    ctx.drawImage(cam, ox, oy, dw, dh);
+    ctx.restore();
+    ctx.fillStyle = "rgba(10,5,0,0.28)"; ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.drawImage(wood, 0, 0);
+  }
+}
+
+// ---------- sound (synthesized, no files) ----------
+function audioOn() {
+  if (ac) return;
+  ac = new AudioContext();
+  noise = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const d = noise.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+}
+function env(node, peak, attack, decay) {
+  const g = ac.createGain(), t = ac.currentTime;
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + attack); g.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+  node.connect(g).connect(ac.destination);
+  return t;
+}
+function noiseHit(type, f0, f1, peak, dur) {
+  if (!ac || muted) return;
+  const src = ac.createBufferSource(), f = ac.createBiquadFilter();
+  src.buffer = noise; f.type = type; f.Q.value = 1.4;
+  const t = env(src.connect(f), peak, 0.01, dur);
+  f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.05);
+}
+function tone(type, f0, f1, peak, dur) {
+  if (!ac || muted) return;
+  const o = ac.createOscillator(); o.type = type;
+  const t = env(o, peak, 0.005, dur);
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+const sfx = {
+  swoosh: () => noiseHit("bandpass", 700, 3200, 0.22, 0.16),
+  splat: () => { noiseHit("lowpass", 2400, 300, 0.35, 0.14); tone("sine", 170, 60, 0.3, 0.12); },
+  boom: () => { noiseHit("lowpass", 900, 60, 0.9, 1.3); tone("sine", 90, 25, 0.7, 1.0); },
+  miss: () => tone("square", 260, 120, 0.08, 0.3),
+  combo: () => { tone("triangle", 660, 990, 0.15, 0.18); setTimeout(() => tone("triangle", 880, 1320, 0.15, 0.2), 90); },
+  over: () => { tone("triangle", 440, 330, 0.15, 0.3); setTimeout(() => tone("triangle", 330, 196, 0.15, 0.5), 260); },
+};
+
+// ---------- blades ----------
+// One blade for the mouse, one per tracked hand. Each keeps its recent points for
+// the trail, and its own combo counter.
+function newBlade() { return { pts: [], seen: 0, sx: 0, sy: 0, swooshAt: 0, combo: 0, comboAt: 0, cx: 0, cy: 0 }; }
+const mouseBlade = newBlade(), handBlades = [newBlade(), newBlade()];
+const allBlades = [mouseBlade, ...handBlades];
+
+function moveBlade(b, x, y, now) {
+  const last = b.pts[b.pts.length - 1];
+  let fast = false;
+  if (last) {
+    const dist = Math.hypot(x - last.x, y - last.y), speed = (dist / Math.max(1, now - last.t)) * 1000 / W;
+    fast = speed > SLICE_SPEED;
+    if (fast) {
+      slice(b, last.x, last.y, x, y, now);
+      if (now - b.swooshAt > 220) { sfx.swoosh(); b.swooshAt = now; }
+    }
+  }
+  b.pts.push({ x, y, t: now, fast });
+  b.seen = now;
+}
+
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, len = dx * dx + dy * dy;
+  const t = len ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len)) : 0;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+function slice(b, ax, ay, bx, by, now) {
+  const angle = Math.atan2(by - ay, bx - ax);
+  for (const f of [...fruits]) {
+    if (segDist(f.x, f.y, ax, ay, bx, by) > f.r * 1.05) continue;
+    fruits.splice(fruits.indexOf(f), 1);
+    if (f.bomb) { explode(f, now); return; }
+    cutFruit(f, angle, bx - ax, by - ay);
+    if (f.starter) { startGame(); continue; }
+    if (mode !== "play") continue;
+    score++;
+    if (now - b.comboAt > COMBO_GAP_MS) b.combo = 0;
+    b.combo++; b.comboAt = now; b.cx = f.x; b.cy = f.y;
+  }
+}
+
+function cutFruit(f, angle, dx, dy) {
+  const t = TYPES[f.type], nx = -Math.sin(angle), ny = Math.cos(angle), push = H * 0.18;
+  for (const side of [-1, 1]) {
+    halves.push({ type: f.type, r: f.r, side, x: f.x, y: f.y, rot: angle,
+      vx: f.vx * 0.6 + nx * side * push + dx * 0.4, vy: f.vy * 0.4 + ny * side * push + dy * 0.4, vr: side * (2 + Math.random() * 3) });
+  }
+  for (let i = 0; i < 22; i++) {
+    const a = Math.random() * Math.PI * 2, s = H * (0.2 + Math.random() * 0.6);
+    parts.push({ x: f.x, y: f.y, vx: Math.cos(a) * s + dx * 2, vy: Math.sin(a) * s + dy * 2, r: R * (0.05 + Math.random() * 0.12), color: t.juice, life: 0, max: 0.4 + Math.random() * 0.5 });
+  }
+  const blobs = Array.from({ length: 9 }, () => ({ dx: (Math.random() - 0.5) * f.r * 2.4, dy: (Math.random() - 0.5) * f.r * 2.4, r: f.r * (0.15 + Math.random() * 0.45) }));
+  stains.push({ x: f.x, y: f.y, color: t.juice, blobs, age: 0 });
+  sfx.splat();
+}
+
+function explode(f, now) {
+  sfx.boom();
+  boomAt = { x: f.x, y: f.y }; boomT = 0;
+  if (mode === "play") mode = "boom";
+}
+
+// ---------- hand tracking ----------
+async function startCamera() {
+  $("camBtn").disabled = $("mouseBtn").disabled = true;
+  audioOn();
+  say("Opening the camera...");
+  try {
+    cam.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "user" } });
+    await cam.play();
+  } catch (err) {
+    say("Couldn't open the camera (" + err.message + "). Mouse mode still works.");
+    $("camBtn").disabled = $("mouseBtn").disabled = false;
+    return;
+  }
+  say("Loading the hand tracker...");
+  try {
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = (delegate) => ({ baseOptions: { delegate,
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" },
+      runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    try { hands = await HandLandmarker.createFromOptions(files, opts("GPU")); }
+    catch { hands = await HandLandmarker.createFromOptions(files, opts("CPU")); }
+  } catch (err) {
+    say("Couldn't load the hand tracker (" + err.message + "). Mouse mode still works.");
+    $("camBtn").disabled = $("mouseBtn").disabled = false;
+    return;
+  }
+  usingCam = true;
+  toMenu();
+}
+
+function trackHands(now) {
+  if (!hands || cam.readyState < 2 || cam.currentTime === lastVideoTime) return;
+  lastVideoTime = cam.currentTime;
+  const res = hands.detectForVideo(cam, now);
+  const { dw, dh, ox, oy } = camRect();
+  // Landmark 8 is the index fingertip. Mirror x to match the mirrored picture.
+  const tips = res.landmarks.map((lm) => ({ x: ox + (1 - lm[8].x) * dw, y: oy + lm[8].y * dh }));
+  const taken = new Set();
+  for (const tip of tips) {
+    // Match each fingertip to the blade it was last frame, so two hands never swap
+    // blades and draw one giant slice across the screen.
+    let pick = null, bestD = W * 0.3;
+    for (const b of handBlades) {
+      if (taken.has(b) || now - b.seen > 200 || !b.pts.length) continue;
+      const d = Math.hypot(tip.x - b.sx, tip.y - b.sy);
+      if (d < bestD) { bestD = d; pick = b; }
+    }
+    if (!pick) {
+      pick = handBlades.find((b) => !taken.has(b) && now - b.seen > 200) || handBlades.find((b) => !taken.has(b));
+      pick.pts = []; pick.sx = tip.x; pick.sy = tip.y;
+    }
+    taken.add(pick);
+    // Light smoothing takes the jitter out of a still finger without lagging a swipe.
+    pick.sx += (tip.x - pick.sx) * 0.7; pick.sy += (tip.y - pick.sy) * 0.7;
+    moveBlade(pick, pick.sx, pick.sy, now);
+  }
+}
+
+// ---------- mouse / touch ----------
+let pointerDown = false;
+cv.addEventListener("pointerdown", (e) => { audioOn(); pointerDown = true; mouseBlade.pts = []; moveBlade(mouseBlade, e.clientX, e.clientY, performance.now()); });
+cv.addEventListener("pointermove", (e) => { if (pointerDown) moveBlade(mouseBlade, e.clientX, e.clientY, performance.now()); });
+addEventListener("pointerup", () => { pointerDown = false; });
+addEventListener("keydown", (e) => {
+  if (e.key === "f" || e.key === "F") document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
+  if (e.key === "m" || e.key === "M") muted = !muted;
+});
+
+$("camBtn").addEventListener("click", startCamera);
+$("mouseBtn").addEventListener("click", () => { audioOn(); usingCam = false; toMenu(); });
+function say(t) { $("msg").textContent = t; }
+
+// ---------- game flow ----------
+function starter() {
+  return { type: "watermelon", r: R * 1.8, x: W / 2, y: H * 0.58, vx: 0, vy: 0, rot: 0, vr: 0.4, starter: true, dots: [] };
+}
+function toMenu() {
+  $("intro").classList.add("gone");
+  mode = "menu"; fruits = [starter()];
+}
+function startGame() {
+  mode = "play"; score = 0; lost = 0; playTime = 0; nextWave = 0.8; waveNo = 0;
+  fruits = []; misses = []; boomAt = null;
+}
+function endGame() {
+  mode = "over";
+  if (score > best) { best = score; try { localStorage.setItem("fruitNinjaBest", String(best)); } catch {} }
+  sfx.over();
+  setTimeout(() => { if (mode === "over") fruits = [starter()]; }, 900);
+}
+
+function spawnWave() {
+  waveNo++;
+  const d = Math.min(1, playTime / 90);           // difficulty ramps over the first 90 seconds
+  const count = 1 + Math.floor(Math.random() * (2 + d * 3));
+  let bombs = 0;
+  for (let i = 0; i < count; i++) {
+    const bomb = waveNo > 2 && bombs === 0 && Math.random() < 0.1 + d * 0.15;
+    if (bomb) bombs++;
+    const type = KINDS[Math.floor(Math.random() * KINDS.length)];
+    const r = bomb ? R : R * TYPES[type].size;
+    const x = W * (0.15 + Math.random() * 0.7), g = GRAVITY * H;
+    const rise = H * (0.45 + Math.random() * 0.4), vy = -Math.sqrt(2 * g * rise), flight = (-vy / g) * 2;
+    const vx = ((W / 2 - x) / flight) * (0.3 + Math.random() * 0.9);
+    const dots = type === "kiwi" ? Array.from({ length: 40 }, () => [Math.random() * 2 - 1, Math.random() * 2 - 1]) : [];
+    setTimeout(() => {
+      if (mode !== "play") return;
+      fruits.push({ type, bomb, r, x, y: H + r, vx, vy, rot: Math.random() * 6, vr: (Math.random() - 0.5) * 4, dots });
+    }, i * (120 + Math.random() * 180));
+  }
+  nextWave = playTime + 1.7 - d * 0.8;
+}
+
+function update(dt, now) {
+  const g = GRAVITY * H;
+  if (mode === "boom") {
+    boomT += dt;
+    if (boomT > 1.4) endGame();
+  } else {
+    if (mode === "play") {
+      playTime += dt;
+      if (playTime >= nextWave) spawnWave();
+    }
+    for (const f of [...fruits]) {
+      if (f.starter) { f.rot += f.vr * dt; f.y = H * 0.58 + Math.sin(now / 500) * R * 0.2; continue; }
+      f.vy += g * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.vr * dt;
+      if (f.y > H + f.r * 2 && f.vy > 0) {
+        fruits.splice(fruits.indexOf(f), 1);
+        if (!f.bomb && mode === "play") {
+          lost++; misses.push({ x: Math.max(30, Math.min(W - 30, f.x)), age: 0 }); sfx.miss();
+          if (lost >= LIVES) endGame();
+        }
+      }
+    }
+  }
+  for (const h of halves) { h.vy += g * dt; h.x += h.vx * dt; h.y += h.vy * dt; h.rot += h.vr * dt; }
+  halves = halves.filter((h) => h.y < H + h.r * 3);
+  for (const p of parts) { p.vy += g * 0.8 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life += dt; }
+  parts = parts.filter((p) => p.life < p.max);
+  for (const s of stains) s.age += dt;
+  stains = stains.filter((s) => s.age < 2.5);
+  for (const m of misses) m.age += dt;
+  misses = misses.filter((m) => m.age < 1.2);
+  for (const p of popups) p.age += dt;
+  popups = popups.filter((p) => p.age < 1.1);
+  // A combo closes once its blade stops cutting for a beat.
+  for (const b of allBlades) {
+    if (b.combo && now - b.comboAt > COMBO_GAP_MS) {
+      if (b.combo >= 3 && mode === "play") {
+        score += b.combo;
+        popups.push({ text: `${b.combo} fruit combo +${b.combo}`, x: b.cx, y: b.cy, age: 0, color: "#ffe04a", size: R * 0.75 });
+        sfx.combo();
+      }
+      b.combo = 0;
+    }
+    b.pts = b.pts.filter((p) => now - p.t < TRAIL_MS);
+  }
+}
+
+// ---------- drawing ----------
+function drawBlade(b, now) {
+  const pts = b.pts;
+  ctx.save(); ctx.lineCap = "round"; ctx.lineJoin = "round";
+  ctx.shadowColor = "#9be7ff"; ctx.shadowBlur = 18;
+  for (let i = 1; i < pts.length; i++) {
+    if (!pts[i].fast) continue;
+    const k = 1 - (now - pts[i].t) / TRAIL_MS;
+    ctx.strokeStyle = `rgba(255,255,255,${Math.max(0, k)})`;
+    ctx.lineWidth = Math.max(1, R * 0.22 * k);
+    ctx.beginPath(); ctx.moveTo(pts[i - 1].x, pts[i - 1].y); ctx.lineTo(pts[i].x, pts[i].y); ctx.stroke();
+  }
+  ctx.restore();
+  // A fingertip marker so you can see where your blade is before you swing.
+  if (b !== mouseBlade && now - b.seen < 200) {
+    circle(b.sx, b.sy, R * 0.16, "rgba(155,231,255,0.35)");
+    circle(b.sx, b.sy, R * 0.07, "#fff");
+  }
+}
+
+function text(s, x, y, size, color, align = "center") {
+  ctx.font = `${size}px ${FONT}`; ctx.textAlign = align; ctx.textBaseline = "middle";
+  ctx.lineWidth = size * 0.16; ctx.strokeStyle = "rgba(40,15,0,0.9)"; ctx.lineJoin = "round";
+  ctx.strokeText(s, x, y); ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+
+function drawX(x, y, s, color) {
+  ctx.save(); ctx.translate(x, y); ctx.strokeStyle = color; ctx.lineCap = "round"; ctx.lineWidth = s * 0.28;
+  ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 6;
+  ctx.beginPath(); ctx.moveTo(-s / 2, -s / 2); ctx.lineTo(s / 2, s / 2); ctx.moveTo(s / 2, -s / 2); ctx.lineTo(-s / 2, s / 2); ctx.stroke();
+  ctx.restore();
+}
+
+function draw(now) {
+  drawBackground();
+  for (const s of stains) {
+    ctx.globalAlpha = 0.5 * (1 - s.age / 2.5); ctx.fillStyle = s.color;
+    for (const b of s.blobs) { ctx.beginPath(); ctx.arc(s.x + b.dx, s.y + b.dy, b.r, 0, Math.PI * 2); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+  for (const h of halves) drawHalf(h);
+  for (const f of fruits) f.bomb ? drawBomb(f, now) : drawWhole(f);
+  for (const p of parts) { ctx.globalAlpha = 1 - p.life / p.max; circle(p.x, p.y, p.r, p.color); }
+  ctx.globalAlpha = 1;
+  for (const b of allBlades) drawBlade(b, now);
+
+  const pad = Math.max(16, R * 0.4);
+  if (mode === "play" || mode === "boom") {
+    text(String(score), pad, pad + R * 0.6, R * 1.2, "#ffe04a", "left");
+    text(`Best ${best}`, pad, pad + R * 1.55, R * 0.45, "#fff4e0", "left");
+    for (let i = 0; i < LIVES; i++) drawX(W - pad - R * 0.5 - i * R * 0.95, pad + R * 0.5, R * (0.55 + i * 0.1), i < lost ? "#ff3b3b" : "rgba(255,255,255,0.35)");
+    for (const m of misses) { ctx.globalAlpha = 1 - m.age / 1.2; drawX(m.x, H - R * 0.8, R * 0.7, "#ff3b3b"); }
+    ctx.globalAlpha = 1;
+  }
+  for (const p of popups) { ctx.globalAlpha = 1 - p.age / 1.1; text(p.text, p.x, p.y - p.age * R, p.size, p.color); }
+  ctx.globalAlpha = 1;
+
+  if (mode === "boom" && boomAt) {
+    const k = Math.min(1, boomT / 1.2);
+    ctx.save(); ctx.translate(boomAt.x, boomAt.y); ctx.fillStyle = "rgba(255,255,255,0.85)";
+    for (let i = 0; i < 14; i++) {
+      const a = (i / 14) * Math.PI * 2 + boomT * 0.3, len = Math.max(W, H) * 1.5 * k;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a - 0.06) * len, Math.sin(a - 0.06) * len); ctx.lineTo(Math.cos(a + 0.06) * len, Math.sin(a + 0.06) * len); ctx.fill();
+    }
+    ctx.restore();
+    ctx.fillStyle = `rgba(255,255,255,${Math.max(0, (boomT - 0.9) * 2)})`; ctx.fillRect(0, 0, W, H);
+  }
+
+  if (mode === "menu") {
+    text("Fruit Ninja", W / 2, H * 0.2, R * 1.5, "#ffcf3f");
+    text("Slice the watermelon to start", W / 2, H * 0.58 + R * 2.6, R * 0.5, "#fff4e0");
+    text(usingCam ? "Point your index finger and swipe fast" : "Hold the mouse button and swipe", W / 2, H * 0.58 + R * 3.3, R * 0.38, "#d9c3a3");
+  }
+  if (mode === "over") {
+    text("Game over", W / 2, H * 0.17, R * 1.4, "#ff5a3c");
+    text(`Score ${score}${score >= best && score > 0 ? "  -  new best!" : `   Best ${best}`}`, W / 2, H * 0.17 + R * 1.4, R * 0.6, "#ffe04a");
+    if (fruits.some((f) => f.starter)) text("Slice to play again", W / 2, H * 0.58 + R * 2.6, R * 0.5, "#fff4e0");
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  // A tab opened in the background can start at zero size and never fire resize.
+  if (innerWidth !== W || innerHeight !== H) resize();
+  if (usingCam) trackHands(now);
+  update(dt, now);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
