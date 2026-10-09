@@ -6,6 +6,11 @@ designedbyshreya). How to run it is in [fruit_ninja.md](fruit_ninja.md).
 Where it stands: working on the real camera. Sensitivity is a live panel, and
 the defaults (swipe 7, detection 6) were tuned by playing.
 
+Published at github.com/anattaj/fruit-ninja (remote `fruit-ninja`). Only this
+folder goes there, never the whole repo: `git subtree split
+--prefix=projects/fruit-ninja -b fruit-ninja-publish`, then push that branch to
+the remote's `main`.
+
 ## Log
 
 - 2026-10-08 - Built as a browser page plus a tiny Node server, like
@@ -18,3 +23,6 @@ the defaults (swipe 7, detection 6) were tuned by playing.
   fixed numbers, since they depend on the camera, light and distance.
 - 2026-10-08 - Swipe 7 and detection 6 felt right on the real camera; made
   them the defaults.
+- 2026-10-08 - Pushed to github.com/anattaj/fruit-ninja as a subtree split of
+  this folder, so the rest of the repo (email accounts, school notes) stays
+  private.
